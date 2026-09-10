@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phycore"
+version = "0.1.0"
+description = "QUASAR Phy family engine: one library, the physics stays in the plugins"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+neural = ["torch>=2.0"]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["phycore*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
