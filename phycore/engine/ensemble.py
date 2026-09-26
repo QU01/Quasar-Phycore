@@ -89,11 +89,17 @@ class EnsembleSurrogate:
         ss_res = np.sum((Yn[vi] - mu_v) ** 2, axis=0)
         ss_tot = np.sum((Yn[vi] - Yn[vi].mean(axis=0)) ** 2, axis=0) + 1e-30
         cov = float(np.mean(np.abs(res_c) <= self.q_conformal * sd_c))
+        # ``cov`` is read on the SAME residuals the quantile was taken from:
+        # >= 1 - alpha by construction. The held-out figure uses the
+        # validation split, which the quantile never saw (it did steer the
+        # members' early stopping, so it is, if anything, optimistic).
+        cov_heldout = float(np.mean(np.abs(Yn[vi] - mu_v) <= self.q_conformal * sd_v))
         self.metrics = {
             "n": n, "n_cal": len(ci), "n_val": len(vi), "n_train": len(ti),
             "r2": [float(v) for v in (1.0 - ss_res / ss_tot)],
             "q_conformal": float(self.q_conformal),
             "coverage_conformal": cov,
+            "coverage_heldout": cov_heldout,
             "reliability_gap_raw": float(gap_raw),
             "reliability_gap_calibrated": float(gap_cal),
         }

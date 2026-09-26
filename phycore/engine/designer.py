@@ -169,6 +169,7 @@ class Designer:
         self.gate = {
             "n": n_l1, "n_all": n_all, "r2": metrics["r2"],
             "coverage": cover, "q_conformal": metrics["q_conformal"],
+            "coverage_heldout": metrics.get("coverage_heldout"),
             "reliability_gap": metrics["reliability_gap_calibrated"],
             "passed": bool(cover >= 1.0 - ALPHA - 0.05),
         }

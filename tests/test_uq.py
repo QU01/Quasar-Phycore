@@ -75,3 +75,18 @@ def test_ensemble_learns_and_keeps_calibration_split():
     assert len(e.cal_index) == m["n_cal"]
     mu, sd = e.predict(X[:5], conformal=True)
     assert mu.shape == (5, 1) and np.all(sd > 0)
+
+
+def test_heldout_coverage_is_read_on_residuals_the_quantile_never_saw():
+    """``coverage_conformal`` is in-sample (>= 1 - alpha by construction);
+    ``coverage_heldout`` is read on the validation split and is what a
+    comparison of honesty between searches must use."""
+    rng = np.random.default_rng(3)
+    X = rng.uniform(-1, 1, (160, 3))
+    Y = np.stack([np.sin(3 * X[:, 0]) + 0.1 * rng.standard_normal(160),
+                  X[:, 1] * X[:, 2] + 0.1 * rng.standard_normal(160)], axis=1)
+    s = EnsembleSurrogate(k=3, seed=0)
+    m = s.fit(X, Y, rng=np.random.default_rng(0))
+    assert m["coverage_conformal"] >= 0.9 - 1e-12
+    assert 0.0 <= m["coverage_heldout"] <= 1.0
+    assert m["coverage_heldout"] != m["coverage_conformal"] or m["n_val"] > 0
