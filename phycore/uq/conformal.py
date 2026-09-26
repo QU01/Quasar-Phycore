@@ -45,6 +45,30 @@ def conformal_quantile(residuals, sigmas, alpha: float = ALPHA) -> float:
     return float(np.max(s)) if k > n else float(np.sort(s)[k - 1])
 
 
+def group_conformal_quantile(groups: dict, alpha: float = ALPHA,
+                             n_min: int = 8) -> tuple:
+    """Group-conditional split conformal with OVERLAPPING groups.
+
+    ``groups`` maps a group name to the normalised scores of the calibration
+    points in that group (a new point belongs to every group passed). Each
+    group with at least ``n_min`` scores (never fewer than eight, the floor of
+    :func:`conformal_quantile`) gets its own quantile; the returned band is
+    their MAX, which covers at >= 1 - alpha within each of those groups
+    (Barber, Candes, Ramdas & Tibshirani 2021, "The limits of distribution-free
+    conditional predictive inference", section 4). Returns ``(q, per_group)``
+    with ``q = None`` when no group is populated - the caller then says it
+    has no calibration instead of inventing one.
+    """
+    n_min = max(int(n_min), 8)
+    per = {}
+    for name, sc in groups.items():
+        s = np.asarray(sc, dtype=float).ravel()
+        s = s[np.isfinite(s)]
+        if len(s) >= n_min:
+            per[name] = conformal_quantile(s, np.ones(len(s)), alpha)
+    return (max(per.values()) if per else None), per
+
+
 def isotonic_fit(x, y) -> tuple:
     """Pool-adjacent-violators. Kuleshov, Fenner & Ermon (2018)."""
     order = np.argsort(x)

@@ -55,3 +55,31 @@ def test_torch_from_jax_bridge():
     F, G = g(th, s)
     F[:, 0].sum().backward()
     assert torch.allclose(th.grad, 2 * th.detach())
+
+
+def test_torch_from_jax_no_grad_skips_the_linearisation():
+    """Under no_grad (PSL's candidate scoring) the bridge runs the function
+    alone: same values, and jax.vjp is never called."""
+    torch = pytest.importorskip("torch")
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+
+    def f(t, s):
+        return jnp.sin(t).sum(-1, keepdims=True) * s, t ** 3
+
+    g = be.torch_from_jax(f)
+    th = torch.tensor([[0.3, 0.4], [1.0, -2.0]], dtype=torch.float64, requires_grad=True)
+    s = torch.tensor([[1.5], [2.0]], dtype=torch.float64)
+    F1, G1 = g(th, s)
+    calls = []
+    real_vjp = jax.vjp
+    jax.vjp = lambda *a, **k: calls.append(1) or real_vjp(*a, **k)
+    try:
+        with torch.no_grad():
+            F2, G2 = g(th, s)
+        F3, G3 = g(th.detach(), s)
+    finally:
+        jax.vjp = real_vjp
+    assert not calls
+    assert torch.equal(F1.detach(), F2) and torch.equal(G1.detach(), G2)
+    assert torch.equal(F2, F3) and not F2.requires_grad

@@ -288,5 +288,16 @@ def torch_from_jax(fn: Callable, n_outputs: int = 2) -> Callable:
 
     @functools.wraps(fn)
     def wrapped(theta_t, s_t):
+        if not (torch.is_grad_enabled() and theta_t.requires_grad):
+            # nothing will call backward: run the function alone. Linearising
+            # it (jax.vjp) costs two to three forward passes and keeps every
+            # residual alive for a backward that never comes (PSL's candidate
+            # scoring runs under no_grad). Same function; the values can differ
+            # from the linearised program's primal by XLA's compilation only
+            # (measured <= 1e-8 relative on Phy-Prop's iterative L0).
+            outs = fn(jnp.asarray(theta_t.detach().cpu().numpy()),
+                      jnp.asarray(s_t.detach().cpu().numpy()))
+            return tuple(torch.as_tensor(np.array(o), device=theta_t.device,
+                                         dtype=theta_t.dtype) for o in outs)
         return _Bridge.apply(theta_t, s_t)
     return wrapped

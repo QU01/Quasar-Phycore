@@ -37,7 +37,10 @@ __version__ = "0.1.0"
 #: It travels with ``model_revision`` in cache keys and run metadata, so
 #: a front produced by an older engine can never be mistaken for a fresh
 #: one.
-ENGINE_REVISION = 2
+#: 3: PSL's residual band on the actor's proposals is split conformal on
+#:    fresh truths (``PSLConfig.band = "proposal"``), not the critic's
+#:    random split of its own pool; Phy-1 (nsga2) is unchanged.
+ENGINE_REVISION = 3
 
 from .plugin import (                                   # noqa: E402
     ContractError, InfeasibleDesign, PhyError, PhyPlugin, repair,

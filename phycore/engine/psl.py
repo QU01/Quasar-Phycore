@@ -41,6 +41,7 @@ import torch.nn as nn
 from ..backend import compile_module, compile_status, torch_device
 from ..plugin import (EVALUATION_ERRORS, fidelity_label, plugin_cell, plugin_label,
                       plugin_violation, reached, repair, spec_vector)
+from ..uq.conformal import ALPHA, group_conformal_quantile
 from .dominance import Individual
 from .hypervolume import hypervolume
 from .sampling import lhs
@@ -230,6 +231,16 @@ class PSLConfig:
     device: str = "auto"             # "auto" -> cuda when available
     compile: bool = False            # torch.compile on the actor body and critic members
     threads: int | None = None       # torch.set_num_threads, None = leave alone
+    # the residual critic's band on the actor's proposals (ENGINE_REVISION 3):
+    #   "proposal": group-conditional conformal - the max of the critic's own
+    #               split quantile and the quantiles of FRESH scores (truths the
+    #               critic had not seen when it predicted them: this spec's
+    #               initial points and past proposals, all past proposals);
+    #   "split":    the critic's random calibration split of its own pool (the
+    #               behaviour up to ENGINE_REVISION 2; it under-covers the actor's
+    #               proposals: A9 of Phy-Prop measured 84.7 % at 90 % nominal)
+    band: str = "proposal"
+    band_n_min: int = 8              # conformal_quantile's own floor
 
 
 class PSLState:
@@ -247,6 +258,9 @@ class PSLState:
         self.build_critic = None
         self.res_critic = None
         self.pools = Pools()
+        # (spec key, "init" | "proposal", |r - mu| / sd_raw) scored BEFORE the
+        # truth joined the critic: the calibration set of the proposal band
+        self.fresh_scores: list = []
         self.prev_specs: list = []
         self.obj_log = None
         self.jit = "none"
@@ -342,6 +356,8 @@ class PSL:
         self.cands: list = []          # (thn, F_exact, v) of this spec's L0 candidates
         self.honesty, self.batch_log, self.history = [], [], []
         self.n_cheap = 0
+        self._band_c = None            # proposal-conformal factor on sd_raw, None = split
+        self.band_log: dict = {"source": "split"}
 
     # --- helpers -----------------------------------------------------------
     def to_phys(self, thn):
@@ -488,12 +504,85 @@ class PSL:
         if self.st.res_critic is not None:
             mask = torch.as_tensor(self.st.obj_log, device=self.dev)
             x = torch.cat([thn_t, s_t, torch.where(mask, torch.log(F0.abs().clamp_min(1e-12)), F0)], -1)
-            mu_r, sd_r = self.st.res_critic.predict(x)
+            mu_r, sd_r = self._res_predict(x)
             corr = 1.0 + mu_r[:, 0] + (cfg.kappa * sd_r[:, 0] if pess else 0.0)
             F = torch.cat([(F0[:, 0] * corr)[:, None], F0[:, 1:]], -1)
         if pess:
             F = F + cfg.kappa * sdF
         return F, G, sd_r[:, 0], mu_r[:, 0]
+
+    # --- the residual band: conformal on fresh truths --------------------------
+    def _spec_key(self):
+        return tuple(np.round(np.asarray(self.s_vec, float), 6).tolist())
+
+    def _res_predict(self, x):
+        """(mu, band) of the residual critic. With a proposal-conformal factor
+        the band is ``c * sd_raw``; otherwise the critic's own split conformal."""
+        crit = self.st.res_critic
+        if self._band_c is None:
+            return crit.predict(x)
+        mu, sd = crit.predict(x, conformal=False)
+        return mu, sd * self._band_c
+
+    def _band_factor(self) -> float:
+        """band / sd_raw in force now (a score's denominator is sd_raw)."""
+        if self._band_c is not None:
+            return float(self._band_c)
+        return float(self.st.res_critic.q.reshape(-1)[0])
+
+    def _calibrate_band(self):
+        """Fix this round's band BEFORE its proposals exist.
+
+        A proposal's residual is judged against three calibration groups it
+        may be exchangeable with, and the band is the MAX of their conformal
+        quantiles (group-conditional conformal with overlapping groups,
+        Barber et al. 2021: >= 1 - ALPHA within each group):
+
+          * "split": the critic's own held-out split of its pool (the band up
+            to ENGINE_REVISION 2 - valid for the pool's distribution);
+          * "spec": fresh truths of THIS spec - its initial points scored by
+            the critic inherited from the previous spec, then its own past
+            proposals;
+          * "proposals": fresh truths of the actor's past proposals over every
+            spec (the selected population the honesty check judges).
+
+        Fresh = scored as ``|r - mu| / sd_raw`` by the critic that predicted
+        them, before they trained it; the proposals scored in a round never
+        calibrate that round. Groups below ``band_n_min`` scores are left out
+        (conformal_quantile's floor); nothing is widened by hand. With no
+        fresh group populated (the first round of a sequence) the split band
+        stays, and ``band_log`` says so."""
+        self._band_c = None
+        self.band_log = {"source": "split"}
+        if self.cfg.band != "proposal" or self.st.res_critic is None:
+            return
+        key = self._spec_key()
+        groups = {"spec": [sc for k, _kind, sc in self.st.fresh_scores if k == key],
+                  "proposals": [sc for _k, kind, sc in self.st.fresh_scores if kind == "proposal"]}
+        c, qs = group_conformal_quantile(groups, ALPHA, self.cfg.band_n_min)
+        n = {g: len(v) for g, v in groups.items()}
+        q_split = float(self.st.res_critic.q.reshape(-1)[0])
+        if c is None:
+            self.band_log = {"source": "split", "n": n, "q": {"split": q_split}}
+            return
+        qs = {"split": q_split, **qs}
+        self._band_c = float(max(qs.values()))
+        self.band_log = {"source": "proposal", "c": self._band_c, "q": qs, "n": n}
+
+    def _score_init(self, rows):
+        """A new spec's initial truths, predicted by the critic INHERITED from
+        the previous spec (it has not seen them): fresh scores of this spec."""
+        crit = self.st.res_critic
+        if crit is None or not rows:
+            return
+        # the inherited critic may live on the device of the previous spec's run
+        X = torch.as_tensor(np.array([x for x, _r in rows], np.float32), device=crit.device)
+        with torch.no_grad():
+            mu, sd = crit.predict(X, conformal=False)
+        mu, sd = mu[:, 0].cpu().numpy(), sd[:, 0].cpu().numpy()
+        key = self._spec_key()
+        for (_x, r), m, sdv in zip(rows, mu, sd):
+            self.st.fresh_scores.append((key, "init", float(abs(r - m) / max(float(sdv), 1e-12))))
 
     def _transform_t(self, F):
         mask = torch.as_tensor(self.st.obj_log, device=self.dev)
@@ -749,6 +838,7 @@ class PSL:
                  f"evaluations at {fidelity_label(self.fidelity)} (device {self.dev}, "
                  f"jit {self.st.jit})")
         if n_init > 0:
+            n_pool = len(self.st.pools.exp_r)
             for thn in self._lhs(n_init):
                 Fc, Gc, build = self._cheap_np(thn)
                 self._add_cheap(thn, Fc, Gc, build)
@@ -759,10 +849,14 @@ class PSL:
                     continue
                 self._record(thn, Fe if ok else Fc, Ge, ok, rec)
                 self._add_exp(thn, Fc, Fe, ok)
+            if self.cfg.band == "proposal":
+                P = self.st.pools
+                self._score_init([(P.exp_X[i], P.exp_r[i][0]) for i in range(n_pool, len(P.exp_r))])
         first = True
         for rd in range(rounds):
             self.log("round", f"{rd + 1}/{rounds}")
             self._fit_critics()
+            self._calibrate_band()
             self._train_actor(cfg.actor_steps + (150 if first else 0))
             first = False
             batch = self._propose(batch_size)
@@ -778,6 +872,8 @@ class PSL:
                 self._train_actor(200)
                 batch = self._propose(batch_size)
             n_before = len(self.theta)
+            factor = self._band_factor() if self.st.res_critic is not None else 1.0
+            scored = []
             for thn, Fc, mu_r, sd in batch:
                 Fe, Ge, rec, ok = self._exp_np(thn)
                 if Fe is None:
@@ -786,13 +882,25 @@ class PSL:
                 self._add_exp(thn, Fc, Fe, ok)
                 if ok and self.st.res_critic is not None:
                     r_true = Fe[0] / max(abs(Fc[0]), 1e-9) - 1.0
-                    self.honesty.append((abs(r_true - float(mu_r)), float(sd), float(r_true)))
+                    err = abs(r_true - float(mu_r))
+                    # (|r - mu|, declared band, r, sd_raw): the 4th column is the
+                    # score's denominator, so a report can re-derive the score
+                    self.honesty.append((err, float(sd), float(r_true), float(sd) / factor))
+                    if sd > 0:
+                        scored.append(err / (float(sd) / factor))
+            # scored only now, after the round's band was declared and used: they
+            # calibrate the NEXT rounds, never the one that measures them
+            if self.cfg.band == "proposal":
+                key = self._spec_key()
+                self.st.fresh_scores.extend((key, "proposal", sc) for sc in scored)
             self.history.append({"round": rd + 1, "inner": inner,
                                  "candidates": self.batch_log[-1][3],
                                  "candidates_feasible": self.batch_log[-1][2],
                                  "spent": len(self.theta) - n_before,
                                  "verified": len(self.theta),
                                  "n_cheap": self.n_cheap,
+                                 "band": dict(self.band_log),
+                                 "scored": len(scored),
                                  "surrogate": dict(self.st.res_critic.metrics)
                                  if self.st.res_critic else {}})
             self.log("acquire", f"{len(self.theta) - n_before} designs to the expensive "
@@ -814,7 +922,7 @@ class PSL:
             "ok": np.array(self.ok, bool), "n_exp": len(self.theta),
             "order": np.arange(len(self.theta)), "n_init": n_init, "batch_size": batch_size,
             "n_cheap": int(self.n_cheap),
-            "honesty": np.array(self.honesty) if self.honesty else np.zeros((0, 3)),
+            "honesty": np.array(self.honesty) if self.honesty else np.zeros((0, 4)),
             "batch_log": self.batch_log, "history": self.history,
             "surrogate_gate": dict(self.st.res_critic.metrics) if self.st.res_critic else {},
         }
